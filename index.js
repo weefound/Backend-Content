@@ -34,6 +34,10 @@ app.use(express.json({ limit: "50mb" })); // Increased limit for larger JSON pay
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, "public")));
 
+app.get("/", (req, res) => {
+  res.send("backend content");
+});
+
 app.post("/api/gemini", async (req, res) => {
   try {
     const { model, prompt } = req.body;
