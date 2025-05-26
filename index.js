@@ -4,7 +4,10 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { fileURLToPath } from "url";
 import ffmpeg from "fluent-ffmpeg";
 import multer from "multer";
-import fs from "fs"; // Add this import for file system operations
+// import fs from "fs";
+import axios from "axios";
+import { v4 as uuidv4 } from "uuid";
+import fs from "fs-extra";
 
 // Configure multer to use disk storage for larger files
 const storage = multer.diskStorage({
@@ -24,6 +27,11 @@ const upload = multer({ storage: storage });
 // Get the directory name
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Definisikan TEMP_DIR sebagai variabel global
+const TEMP_DIR = path.join(__dirname, "temp");
+// Pastikan direktori temp ada dengan izin yang cukup
+fs.ensureDirSync(TEMP_DIR, { mode: 0o755 });
 
 // Initialize express app
 const app = express();
@@ -145,7 +153,493 @@ app.post("/api/audio-buffer", async (req, res) => {
   }
 });
 
-// Start the server
+async function downloadFile(url, outputPath) {
+  const writer = fs.createWriteStream(outputPath);
+  const response = await axios({ url, method: "GET", responseType: "stream" });
+  response.data.pipe(writer);
+  return new Promise((resolve, reject) => {
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+  });
+}
+
+function trimVideo(inputPath, outputPath, duration) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .setDuration(duration)
+      .output(outputPath)
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+}
+
+function concatenateVideos(videoPaths, outputPath) {
+  const listFile = path.join(TEMP_DIR, `concat_${uuidv4()}.txt`);
+  const fileContent = videoPaths.map((p) => `file '${p}'`).join("\n");
+  fs.writeFileSync(listFile, fileContent);
+
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(listFile)
+      .inputOptions(["-f concat", "-safe 0"])
+      .outputOptions("-c copy")
+      .output(outputPath)
+      .on("end", () => {
+        fs.unlinkSync(listFile); // cleanup list file
+        resolve();
+      })
+      .on("error", reject)
+      .run();
+  });
+}
+
+function addAudioToVideo(videoPath, audioPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(videoPath)
+      .input(audioPath)
+      .outputOptions(["-c:v copy", "-c:a aac", "-shortest"])
+      .output(outputPath)
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+}
+// Pastikan direktori temp ada dan memiliki izin tulis
+
+// Tambahkan fungsi baru untuk membuat video dengan looping hingga mencapai durasi yang diinginkan
+async function createLoopedVideo(inputPath, outputPath, requestedDuration) {
+  // Dapatkan durasi asli video
+  const videoDuration = await getVideoDuration(inputPath);
+
+  // Jika durasi video sudah cukup, cukup trim saja
+  if (videoDuration >= requestedDuration) {
+    return trimVideo(inputPath, outputPath, requestedDuration);
+  }
+
+  // Buat file sementara untuk video yang diputar terbalik
+  const reversedVideo = path.join(
+    TEMP_DIR,
+    `reversed_${path.basename(inputPath)}`
+  );
+
+  // Buat video terbalik menggunakan ffmpeg
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions([
+        "-vf reverse", // Filter untuk membalikkan video
+        "-af areverse", // Filter untuk membalikkan audio
+      ])
+      .output(reversedVideo)
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+
+  // Hitung berapa kali perlu melakukan looping ping-pong
+  // Satu siklus ping-pong = durasi video asli + durasi video terbalik
+  const pingPongDuration = videoDuration * 2;
+  const loopCount = Math.ceil(requestedDuration / pingPongDuration);
+
+  // Buat file list untuk concat
+  const listFile = path.join(TEMP_DIR, `pingpong_${uuidv4()}.txt`);
+  let fileContent = "";
+
+  // Tambahkan pasangan video asli dan terbalik beberapa kali ke list
+  for (let i = 0; i < loopCount; i++) {
+    fileContent += `file '${inputPath}'\n`;
+    fileContent += `file '${reversedVideo}'\n`;
+  }
+
+  fs.writeFileSync(listFile, fileContent);
+
+  // Gabungkan video dalam pola ping-pong
+  const loopedVideo = path.join(
+    TEMP_DIR,
+    `looped_${path.basename(outputPath)}`
+  );
+
+  await new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(listFile)
+      .inputOptions(["-f concat", "-safe 0"])
+      .outputOptions("-c copy")
+      .output(loopedVideo)
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+
+  // Trim hasil looping ke durasi yang tepat
+  await trimVideo(loopedVideo, outputPath, requestedDuration);
+
+  // Bersihkan file sementara
+  fs.unlinkSync(listFile);
+  fs.unlinkSync(loopedVideo);
+  fs.unlinkSync(reversedVideo);
+}
+
+// Fungsi untuk mendapatkan durasi video
+function getVideoDuration(videoPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(videoPath, (err, metadata) => {
+      if (err) return reject(err);
+      resolve(metadata.format.duration);
+    });
+  });
+}
+
+// Cara 1: Menggunakan regex langsung pada string
+function extractDurationsFromString(str) {
+  const regex = /Image duration: (\d+) seconds/g;
+  const durations = [];
+  let match;
+
+  while ((match = regex.exec(str)) !== null) {
+    durations.push(parseInt(match[1]));
+  }
+
+  return durations;
+}
+
+// Cara 2: Mencoba parse string menjadi array terlebih dahulu
+function extractDurationsAlternative(inputStr) {
+  try {
+    // Coba parse string menjadi array
+    const textArray = eval(inputStr); // Gunakan eval dengan hati-hati
+    return extractDurations(textArray);
+  } catch (e) {
+    // Jika gagal parse, gunakan regex langsung
+    return extractDurationsFromString(inputStr);
+  }
+}
+
+// Fungsi untuk mengekstrak durasi dari teks
+function extractDurations(textArray) {
+  // Jika input adalah string, ubah menjadi array
+  if (typeof textArray === "string") {
+    try {
+      // Coba parse jika string adalah representasi array
+      textArray = JSON.parse(textArray);
+    } catch (e) {
+      // Jika gagal parse, buat array dengan satu elemen
+      textArray = [textArray];
+    }
+  }
+
+  // Array untuk menyimpan durasi
+  const durations = [];
+
+  // Loop melalui setiap teks
+  textArray.forEach((text) => {
+    // Cari pola "Image duration: X seconds"
+    const match = text.match(/Image duration: (\d+) seconds/);
+    if (match && match[1]) {
+      // Tambahkan durasi ke array
+      durations.push(parseInt(match[1]));
+    }
+  });
+
+  return durations;
+}
+
+// Modifikasi endpoint /merge
+app.post("/merge-create-video", async (req, res) => {
+  const { imageUrl, audioUrl, durasi } = req.body;
+
+  console.log(videos, durasi, audioUrl); // Log video and audioUrl for debugging purpose
+
+  if (!videos || !audioUrl) {
+    return res.status(400).json({ error: "videos and audioUrl are required" });
+  }
+
+  const jobId = uuidv4();
+  const videoOutputPaths = [];
+
+  try {
+    // Download and process all video segments
+    for (const [index, video] of videos.entries()) {
+      const tempVideo = path.join(TEMP_DIR, `${jobId}_video_${index}.mp4`);
+      const processedVideo = path.join(
+        TEMP_DIR,
+        `${jobId}_video_processed_${index}.mp4`
+      );
+
+      await downloadFile(video.url, tempVideo);
+
+      // Gunakan fungsi looping baru alih-alih trimVideo
+      await createLoopedVideo(tempVideo, processedVideo, video.duration);
+
+      videoOutputPaths.push(processedVideo);
+    }
+
+    // Concatenate videos
+    const mergedVideo = path.join(TEMP_DIR, `${jobId}_merged.mp4`);
+    await concatenateVideos(videoOutputPaths, mergedVideo);
+
+    // Download audio
+    const audioPath = path.join(TEMP_DIR, `${jobId}_audio.mp3`);
+    await downloadFile(audioUrl, audioPath);
+
+    // Merge with audio
+    const finalOutput = path.join(TEMP_DIR, `${jobId}_final.mp4`);
+    await addAudioToVideo(mergedVideo, audioPath, finalOutput);
+
+    res.download(finalOutput, "final_video.mp4", () => {
+      fs.removeSync(TEMP_DIR); // Cleanup after download
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Processing failed", detail: err.message });
+  }
+});
+
+// Fungsi untuk mengkonversi gambar menjadi video dengan efek sederhana
+async function createVideoFromImage(imagePath, outputPath, duration, effect) {
+  return new Promise((resolve, reject) => {
+    // Bersihkan path output untuk menghindari masalah karakter khusus
+    const safeOutputPath = outputPath.replace(/[\\/:*?"<>|]/g, "_");
+
+    // Pastikan direktori temp ada
+    const outputDir = path.dirname(outputPath);
+    fs.ensureDirSync(outputDir, { mode: 0o777 }); // Izin penuh untuk direktori
+
+    // Cek apakah file output sudah ada, jika ada hapus dulu
+    if (fs.existsSync(outputPath)) {
+      try {
+        fs.unlinkSync(outputPath);
+      } catch (err) {
+        console.warn("Failed to delete existing output file:", err);
+      }
+    }
+
+    // Gunakan filter sederhana tanpa tanda kutip tambahan
+    ffmpeg(imagePath)
+      .inputOptions(["-loop 1"])
+      .outputOptions([
+        "-vf",
+        "scale=1920:1080", // Diubah dari 1280:720 menjadi 1920:1080
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-t",
+        duration.toString(),
+        "-preset",
+        "slow", // Diubah dari "ultrafast" menjadi "slow" untuk kualitas lebih baik
+        "-crf",
+        "18", // Ditambahkan parameter CRF rendah untuk kualitas tinggi
+        "-tune",
+        "stillimage",
+        "-y", // Paksa overwrite
+      ])
+      .output(outputPath)
+      .on("start", (commandLine) => {
+        console.log("FFmpeg command:", commandLine);
+      })
+      .on("end", resolve)
+      .on("error", (err) => {
+        console.error("FFmpeg error:", err);
+
+        // Jika masih error, coba dengan opsi yang lebih sederhana
+        console.log("Trying with minimal options...");
+        ffmpeg(imagePath)
+          .inputOptions(["-loop 1"])
+          .outputOptions([
+            "-vf",
+            "scale=1920:1080", // Diubah dari 1280:720 menjadi 1920:1080
+            "-c:v",
+            "libx264",
+            "-crf",
+            "20", // Ditambahkan parameter CRF untuk kualitas lebih baik
+            "-t",
+            duration.toString(),
+            "-y",
+          ])
+          .output(outputPath)
+          .on("end", resolve)
+          .on("error", reject)
+          .run();
+      })
+      .run();
+  });
+}
+
+// Fungsi untuk mendapatkan efek kamera secara acak
+function getRandomEffect() {
+  const effects = [
+    "zoom-in",
+    "zoom-out",
+    "pan-left",
+    "pan-right",
+    "shift-up",
+    "shift-down",
+  ];
+
+  return effects[Math.floor(Math.random() * effects.length)];
+}
+
+// Fungsi untuk mengkonversi format durasi "1:26" menjadi detik
+function convertDurationToSeconds(duration) {
+  if (!duration) return 0;
+
+  // Jika sudah dalam bentuk detik (angka)
+  if (!isNaN(duration)) return parseInt(duration);
+
+  // Jika dalam format "1:26"
+  const parts = duration.split(":");
+  if (parts.length === 2) {
+    const minutes = parseInt(parts[0]);
+    const seconds = parseInt(parts[1]);
+    return minutes * 60 + seconds;
+  }
+
+  // Jika dalam format "1:30:45" (jam:menit:detik)
+  if (parts.length === 3) {
+    const hours = parseInt(parts[0]);
+    const minutes = parseInt(parts[1]);
+    const seconds = parseInt(parts[2]);
+    return hours * 3600 + minutes * 60 + seconds;
+  }
+
+  return 0;
+}
+
+// Endpoint untuk merge-image
+app.post("/merge-image", async (req, res) => {
+  const { imageUrls, audioUrl, durasi, effects, durasiMusic } = req.body;
+
+  // Hapus definisi lokal TEMP_DIR karena sudah didefinisikan secara global
+  // const TEMP_DIR = path.join(__dirname, "temp");
+  // fs.ensureDirSync(TEMP_DIR, { mode: 0o755 });
+
+  // Bersihkan direktori temp sebelum memulai proses baru
+  try {
+    fs.emptyDirSync(TEMP_DIR);
+  } catch (err) {
+    console.error("Error cleaning temp directory:", err);
+  }
+
+  if (!imageUrls || !audioUrl || !imageUrls.length) {
+    return res.status(400).json({ error: "imageUrls dan audioUrl diperlukan" });
+  }
+
+  // Konversi durasi musik ke detik
+  const totalDurationInSeconds = convertDurationToSeconds(durasiMusic);
+
+  // Hitung durasi yang adil untuk setiap gambar
+  const fairDurationPerImage = Math.floor(
+    totalDurationInSeconds / imageUrls.length
+  );
+
+  // Buat array durasi yang adil untuk setiap gambar
+  const imageDurations = Array(imageUrls.length).fill(fairDurationPerImage);
+
+  // Distribusikan sisa detik (jika ada) ke gambar-gambar awal
+  const remainingSeconds =
+    totalDurationInSeconds - fairDurationPerImage * imageUrls.length;
+  for (let i = 0; i < remainingSeconds; i++) {
+    imageDurations[i % imageUrls.length]++;
+  }
+
+  // Validasi effects
+  let imageEffects = [];
+  if (Array.isArray(effects) && effects.length > 0) {
+    imageEffects = effects;
+  }
+
+  // Pastikan setiap gambar memiliki efek
+  if (imageEffects.length < imageUrls.length) {
+    // Isi efek yang kurang dengan efek acak
+    for (let i = imageEffects.length; i < imageUrls.length; i++) {
+      imageEffects.push(getRandomEffect());
+    }
+  }
+
+  const jobId = uuidv4();
+  const videoOutputPaths = [];
+
+  try {
+    // Download dan proses semua gambar
+    for (const [index, imageUrl] of imageUrls.entries()) {
+      // Bersihkan URL dari backticks jika ada
+      const cleanImageUrl = imageUrl.replace(/`/g, "").trim();
+
+      const tempImage = path.join(TEMP_DIR, `${jobId}_image_${index}.jpg`);
+      const processedVideo = path.join(TEMP_DIR, `${jobId}_video_${index}.mp4`);
+
+      try {
+        // Download gambar
+        await downloadFile(cleanImageUrl, tempImage);
+
+        // Verifikasi file gambar ada
+        if (!fs.existsSync(tempImage)) {
+          throw new Error(`File gambar tidak berhasil diunduh: ${tempImage}`);
+        }
+
+        // Konversi gambar menjadi video dengan efek kamera
+        await createVideoFromImage(
+          tempImage,
+          processedVideo,
+          imageDurations[index],
+          imageEffects[index]
+        );
+
+        videoOutputPaths.push(processedVideo);
+      } catch (err) {
+        console.error(`Error processing image ${index}:`, err);
+        throw err; // Re-throw untuk ditangkap di catch utama
+      }
+    }
+
+    // Gabungkan semua video
+    const mergedVideo = path.join(TEMP_DIR, `${jobId}_merged.mp4`);
+    await concatenateVideos(videoOutputPaths, mergedVideo);
+
+    // Download audio (bersihkan URL dari backticks jika ada)
+    const cleanAudioUrl = audioUrl.replace(/`/g, "").trim();
+    const audioPath = path.join(TEMP_DIR, `${jobId}_audio.mp3`);
+    await downloadFile(cleanAudioUrl, audioPath);
+
+    // Gabungkan video dengan audio
+    const finalOutput = path.join(TEMP_DIR, `${jobId}_final.mp4`);
+    await addAudioToVideo(mergedVideo, audioPath, finalOutput);
+
+    // Perbaikan untuk memastikan video dapat diputar dengan benar
+    const optimizedOutput = path.join(TEMP_DIR, `${jobId}_optimized.mp4`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(finalOutput)
+        .outputOptions([
+          "-movflags faststart", // Optimasi untuk streaming
+          "-pix_fmt yuv420p", // Format pixel yang kompatibel
+          "-c:v libx264", // Codec video
+          "-c:a aac", // Codec audio
+        ])
+        .output(optimizedOutput)
+        .on("end", resolve)
+        .on("error", reject)
+        .run();
+    });
+
+    // Kirim file hasil sebagai respons
+    res.download(optimizedOutput, "final_video.mp4", () => {
+      // Bersihkan file sementara setelah download selesai
+      fs.removeSync(TEMP_DIR);
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Pemrosesan gagal", detail: err.message });
+    // Bersihkan file sementara jika terjadi error
+    try {
+      fs.removeSync(TEMP_DIR);
+    } catch (cleanupErr) {
+      console.error("Error cleaning up temp directory:", cleanupErr);
+    }
+  }
+});
+
+// End the server
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 });
