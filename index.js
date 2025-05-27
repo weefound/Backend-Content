@@ -32,7 +32,7 @@ const __dirname = path.dirname(__filename);
 
 // Definisikan TEMP_DIR sebagai variabel global
 const TEMP_DIR = path.join(__dirname, "temp");
-// Pastikan direktori temp ada dengan izin yang cukup
+// Pastikan direktori temp ada dengan izin yang cukupffprobe
 fs.ensureDirSync(TEMP_DIR, { mode: 0o755 });
 
 // Initialize express app
