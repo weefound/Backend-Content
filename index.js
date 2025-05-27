@@ -25,7 +25,8 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage: multer.memoryStorage() });
-
+const app = express();
+const server = http.createServer(app);
 // Get the directory name
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,13 +37,13 @@ const TEMP_DIR = path.join(__dirname, "temp");
 fs.ensureDirSync(TEMP_DIR, { mode: 0o755 });
 
 // Initialize express app
-const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(express.json()); // Increased limit for larger JSON payloads
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.urlencoded({ extended: true }));
+server.setTimeout(3600000);
 
 app.get("/", (req, res) => {
   res.send("backend content");
