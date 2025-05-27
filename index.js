@@ -412,7 +412,7 @@ app.post("/merge-create-video", async (req, res) => {
 });
 
 // Fungsi untuk mengkonversi gambar menjadi video dengan efek sederhana
-async function createVideoFromImage(imagePath, outputPath, duration, effect) {
+async function createVideoFromImage(imagePath, outputPath, duration) {
   return new Promise((resolve, reject) => {
     // Bersihkan path output untuk menghindari masalah karakter khusus
     const safeOutputPath = outputPath.replace(/[\\/:*?"<>|]/g, "_");
@@ -431,39 +431,39 @@ async function createVideoFromImage(imagePath, outputPath, duration, effect) {
     }
 
     // Tentukan filter berdasarkan efek yang dipilih
-    let vfFilter = "scale=1920:1080";
+    let vfFilter = "scale=2560:1440";
 
     // Hitung total frame berdasarkan durasi (60 fps untuk pergerakan sangat halus)
     const totalFrames = Math.round(duration * 60);
 
     // Terapkan efek yang sesuai dengan pergerakan yang lebih halus
-    if (effect) {
-      switch (effect) {
-        case "zoom-out":
-          // Zoom out perlahan dari 1.3 ke 1.0 sepanjang durasi video dengan kurva halus
-          vfFilter = `zoompan=z='1.3-(0.3*on/${totalFrames})':d=${totalFrames}:s=1920x1080:fps=60`;
-          break;
-        case "pan-left":
-          // Pan dari kanan ke kiri perlahan sepanjang durasi video
-          vfFilter = `zoompan=z=1.1:x='iw-(iw*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
-          break;
-        case "pan-right":
-          // Pan dari kiri ke kanan perlahan sepanjang durasi video
-          vfFilter = `zoompan=z=1.1:x='0+(iw*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
-          break;
-        case "shift-up":
-          // Shift dari bawah ke atas perlahan sepanjang durasi video
-          vfFilter = `zoompan=z=1.1:y='ih-(ih*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
-          break;
-        case "shift-down":
-          // Shift dari atas ke bawah perlahan sepanjang durasi video
-          vfFilter = `zoompan=z=1.1:y='0+(ih*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
-          break;
-        default:
-          // Gunakan scale default jika efek tidak dikenali
-          break;
-      }
-    }
+    // if (effect) {
+    //   switch (effect) {
+    //     case "zoom-out":
+    //       // Zoom out perlahan dari 1.3 ke 1.0 sepanjang durasi video dengan kurva halus
+    //       vfFilter = `zoompan=z='1.3-(0.3*on/${totalFrames})':d=${totalFrames}:s=1920x1080:fps=60`;
+    //       break;
+    //     case "pan-left":
+    //       // Pan dari kanan ke kiri perlahan sepanjang durasi video
+    //       vfFilter = `zoompan=z=1.1:x='iw-(iw*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
+    //       break;
+    //     case "pan-right":
+    //       // Pan dari kiri ke kanan perlahan sepanjang durasi video
+    //       vfFilter = `zoompan=z=1.1:x='0+(iw*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
+    //       break;
+    //     case "shift-up":
+    //       // Shift dari bawah ke atas perlahan sepanjang durasi video
+    //       vfFilter = `zoompan=z=1.1:y='ih-(ih*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
+    //       break;
+    //     case "shift-down":
+    //       // Shift dari atas ke bawah perlahan sepanjang durasi video
+    //       vfFilter = `zoompan=z=1.1:y='0+(ih*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
+    //       break;
+    //     default:
+    //       // Gunakan scale default jika efek tidak dikenali
+    //       break;
+    //   }
+    // }
 
     // Gunakan filter dengan efek yang dipilih
     ffmpeg(imagePath)
@@ -503,15 +503,15 @@ async function createVideoFromImage(imagePath, outputPath, duration, effect) {
           .inputOptions(["-loop 1"])
           .outputOptions([
             "-vf",
-            "scale=1920:1080", // Tetap gunakan resolusi 1080p
+            "-vf scale=2560:1440", // Ubah ke resolusi 2K
             "-c:v",
             "libx264",
             "-crf",
-            "20", // Ditambahkan parameter CRF untuk kualitas lebih baik
+            "20",
             "-t",
             duration.toString(),
-            "-r", // Tambahkan parameter frame rate output
-            "60", // Set output frame rate ke 60fps
+            "-r",
+            "60",
             "-y",
           ])
           .output(outputPath)
@@ -660,10 +660,14 @@ app.post("/merge-image", async (req, res) => {
     await new Promise((resolve, reject) => {
       ffmpeg(finalOutput)
         .outputOptions([
-          "-movflags faststart", // Optimasi untuk streaming
-          "-pix_fmt yuv420p", // Format pixel yang kompatibel
-          "-c:v libx264", // Codec video
-          "-c:a aac", // Codec audio
+          "-movflags faststart",
+          "-pix_fmt yuv420p",
+          "-c:v libx264",
+          "-c:a aac",
+          "-vf scale=2560:1440", // Ubah ke resolusi 2K
+          "-aspect 16:9",
+          "-preset ultrafast",
+          "-crf 23",
         ])
         .output(optimizedOutput)
         .on("end", resolve)
