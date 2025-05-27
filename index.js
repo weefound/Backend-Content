@@ -22,7 +22,7 @@ const storage = multer.diskStorage({
   },
 });
 
-const upload = multer({ storage: storage });
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Get the directory name
 const __filename = fileURLToPath(import.meta.url);
@@ -38,48 +38,60 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(express.json({ limit: "50mb" })); // Increased limit for larger JSON payloads
-app.use(express.urlencoded({ extended: false }));
+app.use(express.json()); // Increased limit for larger JSON payloads
 app.use(express.static(path.join(__dirname, "public")));
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/", (req, res) => {
   res.send("backend content");
 });
 
-app.post("/api/gemini", async (req, res) => {
+app.post("/api/gemini", upload.single("file"), async (req, res) => {
   try {
-    const { model, prompt } = req.body;
-    console.log(model, prompt);
+    let model = req.body.model;
+    let prompt = req.body.prompt;
+    const file = req.file;
+
+    const parts = [{ text: prompt }];
+
+    if (file) {
+      const mimeType = file.mimetype;
+      const imageData = file.buffer.toString("base64");
+
+      parts.push({
+        inlineData: {
+          mimeType,
+          data: imageData,
+        },
+      });
+    }
+
+    const config = {
+      responseModalities: ["IMAGE", "TEXT"],
+      responseMimeType: "text/plain",
+    };
+
     const ai = new GoogleGenAI({
       apiKey: "AIzaSyAsJM4yX-VOCG0dczPcSy3xPuMV_savlSE",
     });
 
-    const config = {
-      responseModalities: ["TEXT", "IMAGE"],
-    };
     const contents = [
       {
         role: "user",
-        parts: [
-          {
-            text: prompt,
-          },
-        ],
+        parts: parts,
       },
     ];
 
-    // Set responseModalities to include "Image" so the model can generate  an image
     const response = await ai.models.generateContent({
-      model: model,
+      model,
       config,
       contents,
     });
 
-    // res.status(200).json({ status: 200, data: response.candidates[0].content });
     res.status(200).json({ status: 200, data: response });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ status: 500, data: error.message });
+    res.status(500).json({ status: 500, message: error.message });
   }
 });
 
@@ -414,12 +426,47 @@ async function createVideoFromImage(imagePath, outputPath, duration, effect) {
       }
     }
 
-    // Gunakan filter sederhana tanpa tanda kutip tambahan
+    // Tentukan filter berdasarkan efek yang dipilih
+    let vfFilter = "scale=1920:1080";
+
+    // Hitung total frame berdasarkan durasi (60 fps untuk pergerakan sangat halus)
+    const totalFrames = Math.round(duration * 60);
+
+    // Terapkan efek yang sesuai dengan pergerakan yang lebih halus
+    if (effect) {
+      switch (effect) {
+        case "zoom-out":
+          // Zoom out perlahan dari 1.3 ke 1.0 sepanjang durasi video dengan kurva halus
+          vfFilter = `zoompan=z='1.3-(0.3*on/${totalFrames})':d=${totalFrames}:s=1920x1080:fps=60`;
+          break;
+        case "pan-left":
+          // Pan dari kanan ke kiri perlahan sepanjang durasi video
+          vfFilter = `zoompan=z=1.1:x='iw-(iw*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
+          break;
+        case "pan-right":
+          // Pan dari kiri ke kanan perlahan sepanjang durasi video
+          vfFilter = `zoompan=z=1.1:x='0+(iw*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
+          break;
+        case "shift-up":
+          // Shift dari bawah ke atas perlahan sepanjang durasi video
+          vfFilter = `zoompan=z=1.1:y='ih-(ih*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
+          break;
+        case "shift-down":
+          // Shift dari atas ke bawah perlahan sepanjang durasi video
+          vfFilter = `zoompan=z=1.1:y='0+(ih*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
+          break;
+        default:
+          // Gunakan scale default jika efek tidak dikenali
+          break;
+      }
+    }
+
+    // Gunakan filter dengan efek yang dipilih
     ffmpeg(imagePath)
       .inputOptions(["-loop 1"])
       .outputOptions([
         "-vf",
-        "scale=1920:1080", // Diubah dari 1280:720 menjadi 1920:1080
+        vfFilter,
         "-c:v",
         "libx264",
         "-pix_fmt",
@@ -427,11 +474,13 @@ async function createVideoFromImage(imagePath, outputPath, duration, effect) {
         "-t",
         duration.toString(),
         "-preset",
-        "slow", // Diubah dari "ultrafast" menjadi "slow" untuk kualitas lebih baik
+        "slow", // Menggunakan preset "slow" untuk kualitas lebih baik
         "-crf",
-        "18", // Ditambahkan parameter CRF rendah untuk kualitas tinggi
+        "18", // CRF rendah (18) untuk kualitas tinggi
         "-tune",
         "stillimage",
+        "-r", // Tambahkan parameter frame rate output
+        "60", // Set output frame rate ke 60fps
         "-y", // Paksa overwrite
       ])
       .output(outputPath)
@@ -444,17 +493,21 @@ async function createVideoFromImage(imagePath, outputPath, duration, effect) {
 
         // Jika masih error, coba dengan opsi yang lebih sederhana
         console.log("Trying with minimal options...");
+
+        // Gunakan scale default untuk fallback
         ffmpeg(imagePath)
           .inputOptions(["-loop 1"])
           .outputOptions([
             "-vf",
-            "scale=1920:1080", // Diubah dari 1280:720 menjadi 1920:1080
+            "scale=1920:1080", // Tetap gunakan resolusi 1080p
             "-c:v",
             "libx264",
             "-crf",
             "20", // Ditambahkan parameter CRF untuk kualitas lebih baik
             "-t",
             duration.toString(),
+            "-r", // Tambahkan parameter frame rate output
+            "60", // Set output frame rate ke 60fps
             "-y",
           ])
           .output(outputPath)
@@ -469,7 +522,6 @@ async function createVideoFromImage(imagePath, outputPath, duration, effect) {
 // Fungsi untuk mendapatkan efek kamera secara acak
 function getRandomEffect() {
   const effects = [
-    "zoom-in",
     "zoom-out",
     "pan-left",
     "pan-right",
@@ -508,7 +560,8 @@ function convertDurationToSeconds(duration) {
 
 // Endpoint untuk merge-image
 app.post("/merge-image", async (req, res) => {
-  const { imageUrls, audioUrl, durasi, effects, durasiMusic } = req.body;
+  const { imageUrls, audioUrl, durasi, durasiMusic } = req.body;
+  // Hapus 'effects' dari destructuring karena kita akan selalu menggunakan efek acak
 
   // Hapus definisi lokal TEMP_DIR karena sudah didefinisikan secara global
   // const TEMP_DIR = path.join(__dirname, "temp");
@@ -543,18 +596,10 @@ app.post("/merge-image", async (req, res) => {
     imageDurations[i % imageUrls.length]++;
   }
 
-  // Validasi effects
-  let imageEffects = [];
-  if (Array.isArray(effects) && effects.length > 0) {
-    imageEffects = effects;
-  }
-
-  // Pastikan setiap gambar memiliki efek
-  if (imageEffects.length < imageUrls.length) {
-    // Isi efek yang kurang dengan efek acak
-    for (let i = imageEffects.length; i < imageUrls.length; i++) {
-      imageEffects.push(getRandomEffect());
-    }
+  // Buat array efek acak untuk setiap gambar
+  const imageEffects = [];
+  for (let i = 0; i < imageUrls.length; i++) {
+    imageEffects.push(getRandomEffect());
   }
 
   const jobId = uuidv4();
@@ -578,7 +623,7 @@ app.post("/merge-image", async (req, res) => {
           throw new Error(`File gambar tidak berhasil diunduh: ${tempImage}`);
         }
 
-        // Konversi gambar menjadi video dengan efek kamera
+        // Konversi gambar menjadi video dengan efek kamera acak
         await createVideoFromImage(
           tempImage,
           processedVideo,
