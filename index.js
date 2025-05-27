@@ -8,6 +8,8 @@ import multer from "multer";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
 import fs from "fs-extra";
+import dotenv from "dotenv";
+dotenv.config();
 
 // Configure multer to use disk storage for larger files
 const storage = multer.diskStorage({
@@ -72,7 +74,7 @@ app.post("/api/gemini", upload.single("file"), async (req, res) => {
     };
 
     const ai = new GoogleGenAI({
-      apiKey: "AIzaSyAsJM4yX-VOCG0dczPcSy3xPuMV_savlSE",
+      apiKey: process.env.GOOGLE_GENAI_API_KEY,
     });
 
     const contents = [
