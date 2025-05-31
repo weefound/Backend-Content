@@ -454,7 +454,7 @@ function createVideoFromImage(imagePath, outputPath, duration) {
     const timeout = setTimeout(() => {
       console.log(`Timeout for ${path.basename(imagePath)}`);
       reject(new Error(`Video creation timeout for ${imagePath}`));
-    }, 120000); // 2 menit timeout untuk 2K
+    }, 600000); // 10 menit timeout untuk 2K
 
     // Filter untuk 2K (2560x1440) dengan aspect ratio yang benar
     const videoFilter =
@@ -469,7 +469,7 @@ function createVideoFromImage(imagePath, outputPath, duration) {
         "-pix_fmt yuv420p",
         "-r 60", // 60 fps
         "-preset medium", // Balance antara speed dan quality
-        "-crf 18", // High quality untuk 2K
+        "-crf 20", // High quality untuk 2K
         "-profile:v high",
         "-level:v 4.2",
         "-an", // No audio
@@ -548,7 +548,7 @@ function concatenateVideos(videoPaths, outputPath) {
       .outputOptions([
         "-c:v libx264",
         "-preset medium",
-        "-crf 18", // High quality untuk 2K
+        "-crf 20", // High quality untuk 2K
         "-pix_fmt yuv420p",
         "-r 60", // Maintain 60fps
         "-profile:v high",
@@ -631,7 +631,7 @@ function addAudioToVideo(
       const timeout = setTimeout(() => {
         console.log("Video-audio combination timeout");
         reject(new Error("Video-audio combination timeout"));
-      }, 300000); // 5 menit timeout
+      }, 600000); // 5 menit timeout
 
       ffmpeg()
         .input(videoPath)
@@ -873,7 +873,7 @@ app.post("/merge-image", async (req, res) => {
         } catch (e) {
           console.error("Cleanup error:", e);
         }
-      }, 5000);
+      }, 600000);
     });
   } catch (error) {
     console.error("Processing error:", error);
