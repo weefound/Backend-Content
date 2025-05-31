@@ -10,6 +10,7 @@ import { v4 as uuidv4 } from "uuid";
 import fs from "fs-extra";
 import dotenv from "dotenv";
 import http from "http";
+import https from "https";
 dotenv.config();
 
 // Configure multer to use disk storage for larger files
@@ -169,525 +170,723 @@ app.post("/api/audio-buffer", async (req, res) => {
   }
 });
 
-async function downloadFile(url, outputPath) {
-  const writer = fs.createWriteStream(outputPath);
-  const response = await axios({ url, method: "GET", responseType: "stream" });
-  response.data.pipe(writer);
+// Fungsi untuk validasi format file dengan ffprobe sebelum memproses
+function validateMediaFile(filePath, type) {
   return new Promise((resolve, reject) => {
-    writer.on("finish", resolve);
-    writer.on("error", reject);
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) {
+        console.error(`Invalid ${type} file: ${filePath}`, err);
+        return reject(new Error(`Invalid ${type} file: ${filePath}`));
+      }
+
+      // Validasi format sesuai tipe
+      if (
+        type === "audio" &&
+        (!metadata.streams ||
+          !metadata.streams.some((s) => s.codec_type === "audio"))
+      ) {
+        return reject(new Error(`File is not a valid audio: ${filePath}`));
+      }
+      if (
+        type === "image" &&
+        (!metadata.streams ||
+          !metadata.streams.some((s) => s.codec_type === "video"))
+      ) {
+        return reject(new Error(`File is not a valid image: ${filePath}`));
+      }
+
+      resolve(metadata);
+    });
   });
 }
 
-function trimVideo(inputPath, outputPath, duration) {
+// Fungsi untuk mendapatkan durasi audio - DIPERBAIKI
+function getAudioDuration(audioPath) {
   return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(audioPath, (err, metadata) => {
+      if (err) {
+        console.error(`Error getting duration for ${audioPath}:`, err);
+        return reject(err);
+      }
+      const duration = metadata.format.duration;
+      console.log(`Duration for ${path.basename(audioPath)}: ${duration}s`);
+      resolve(duration);
+    });
+  });
+}
+
+// Alternative version dengan pendekatan yang lebih sederhana
+function trimAudio(inputPath, outputPath, duration) {
+  return new Promise((resolve, reject) => {
+    if (!fs.existsSync(inputPath)) {
+      return reject(new Error("Input audio file not found"));
+    }
+
+    const outputDir = path.dirname(outputPath);
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    // Approach yang lebih sederhana tanpa ffprobe dulu
     ffmpeg(inputPath)
-      .setDuration(duration)
+      .format("mp3") // Set output format explicitly
+      .duration(duration) // FFmpeg akan handle jika duration > original
+      .audioCodec("libmp3lame")
+      .audioBitrate("128k")
+      .audioChannels(2)
+      .audioFrequency(44100)
       .output(outputPath)
-      .on("end", resolve)
-      .on("error", reject)
-      .run();
-  });
-}
-
-function concatenateVideos(videoPaths, outputPath) {
-  const listFile = path.join(TEMP_DIR, `concat_${uuidv4()}.txt`);
-  const fileContent = videoPaths.map((p) => `file '${p}'`).join("\n");
-  fs.writeFileSync(listFile, fileContent);
-
-  return new Promise((resolve, reject) => {
-    ffmpeg()
-      .input(listFile)
-      .inputOptions(["-f concat", "-safe 0"])
-      .outputOptions("-c copy")
-      .output(outputPath)
+      .on("start", (cmd) => {
+        console.log("Trim command:", cmd);
+      })
       .on("end", () => {
-        fs.unlinkSync(listFile); // cleanup list file
+        console.log(`Trim completed: ${path.basename(outputPath)}`);
         resolve();
       })
-      .on("error", reject)
+      .on("error", (err) => {
+        console.error("Trim error:", err);
+        reject(err);
+      })
       .run();
   });
 }
 
-function addAudioToVideo(videoPath, audioPath, outputPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg()
-      .input(videoPath)
-      .input(audioPath)
-      .outputOptions(["-c:v copy", "-c:a aac", "-shortest"])
-      .output(outputPath)
-      .on("end", resolve)
-      .on("error", reject)
-      .run();
-  });
-}
-// Pastikan direktori temp ada dan memiliki izin tulis
-
-// Tambahkan fungsi baru untuk membuat video dengan looping hingga mencapai durasi yang diinginkan
-async function createLoopedVideo(inputPath, outputPath, requestedDuration) {
-  // Dapatkan durasi asli video
-  const videoDuration = await getVideoDuration(inputPath);
-
-  // Jika durasi video sudah cukup, cukup trim saja
-  if (videoDuration >= requestedDuration) {
-    return trimVideo(inputPath, outputPath, requestedDuration);
-  }
-
-  // Buat file sementara untuk video yang diputar terbalik
-  const reversedVideo = path.join(
-    TEMP_DIR,
-    `reversed_${path.basename(inputPath)}`
-  );
-
-  // Buat video terbalik menggunakan ffmpeg
-  await new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .outputOptions([
-        "-vf reverse", // Filter untuk membalikkan video
-        "-af areverse", // Filter untuk membalikkan audio
-      ])
-      .output(reversedVideo)
-      .on("end", resolve)
-      .on("error", reject)
-      .run();
-  });
-
-  // Hitung berapa kali perlu melakukan looping ping-pong
-  // Satu siklus ping-pong = durasi video asli + durasi video terbalik
-  const pingPongDuration = videoDuration * 2;
-  const loopCount = Math.ceil(requestedDuration / pingPongDuration);
-
-  // Buat file list untuk concat
-  const listFile = path.join(TEMP_DIR, `pingpong_${uuidv4()}.txt`);
-  let fileContent = "";
-
-  // Tambahkan pasangan video asli dan terbalik beberapa kali ke list
-  for (let i = 0; i < loopCount; i++) {
-    fileContent += `file '${inputPath}'\n`;
-    fileContent += `file '${reversedVideo}'\n`;
-  }
-
-  fs.writeFileSync(listFile, fileContent);
-
-  // Gabungkan video dalam pola ping-pong
-  const loopedVideo = path.join(
-    TEMP_DIR,
-    `looped_${path.basename(outputPath)}`
-  );
-
-  await new Promise((resolve, reject) => {
-    ffmpeg()
-      .input(listFile)
-      .inputOptions(["-f concat", "-safe 0"])
-      .outputOptions("-c copy")
-      .output(loopedVideo)
-      .on("end", resolve)
-      .on("error", reject)
-      .run();
-  });
-
-  // Trim hasil looping ke durasi yang tepat
-  await trimVideo(loopedVideo, outputPath, requestedDuration);
-
-  // Bersihkan file sementara
-  fs.unlinkSync(listFile);
-  fs.unlinkSync(loopedVideo);
-  fs.unlinkSync(reversedVideo);
-}
-
-// Fungsi untuk mendapatkan durasi video
-function getVideoDuration(videoPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(videoPath, (err, metadata) => {
-      if (err) return reject(err);
-      resolve(metadata.format.duration);
-    });
-  });
-}
-
-// Cara 1: Menggunakan regex langsung pada string
-function extractDurationsFromString(str) {
-  const regex = /Image duration: (\d+) seconds/g;
-  const durations = [];
-  let match;
-
-  while ((match = regex.exec(str)) !== null) {
-    durations.push(parseInt(match[1]));
-  }
-
-  return durations;
-}
-
-// Cara 2: Mencoba parse string menjadi array terlebih dahulu
-function extractDurationsAlternative(inputStr) {
-  try {
-    // Coba parse string menjadi array
-    const textArray = eval(inputStr); // Gunakan eval dengan hati-hati
-    return extractDurations(textArray);
-  } catch (e) {
-    // Jika gagal parse, gunakan regex langsung
-    return extractDurationsFromString(inputStr);
-  }
-}
-
-// Fungsi untuk mengekstrak durasi dari teks
-function extractDurations(textArray) {
-  // Jika input adalah string, ubah menjadi array
-  if (typeof textArray === "string") {
+// Fungsi untuk loop audio - DIPERBAIKI dengan pendekatan yang lebih stabil
+function loopAudio(inputPath, outputPath, targetDuration) {
+  return new Promise(async (resolve, reject) => {
     try {
-      // Coba parse jika string adalah representasi array
-      textArray = JSON.parse(textArray);
-    } catch (e) {
-      // Jika gagal parse, buat array dengan satu elemen
-      textArray = [textArray];
-    }
-  }
-
-  // Array untuk menyimpan durasi
-  const durations = [];
-
-  // Loop melalui setiap teks
-  textArray.forEach((text) => {
-    // Cari pola "Image duration: X seconds"
-    const match = text.match(/Image duration: (\d+) seconds/);
-    if (match && match[1]) {
-      // Tambahkan durasi ke array
-      durations.push(parseInt(match[1]));
-    }
-  });
-
-  return durations;
-}
-
-// Modifikasi endpoint /merge
-app.post("/merge-create-video", async (req, res) => {
-  const { imageUrl, audioUrl, durasi } = req.body;
-
-  console.log(videos, durasi, audioUrl); // Log video and audioUrl for debugging purpose
-
-  if (!videos || !audioUrl) {
-    return res.status(400).json({ error: "videos and audioUrl are required" });
-  }
-
-  const jobId = uuidv4();
-  const videoOutputPaths = [];
-
-  try {
-    // Download and process all video segments
-    for (const [index, video] of videos.entries()) {
-      const tempVideo = path.join(TEMP_DIR, `${jobId}_video_${index}.mp4`);
-      const processedVideo = path.join(
-        TEMP_DIR,
-        `${jobId}_video_processed_${index}.mp4`
+      console.log(
+        `Looping audio: ${path.basename(inputPath)} to ${targetDuration}s`
       );
 
-      await downloadFile(video.url, tempVideo);
+      const originalDuration = await getAudioDuration(inputPath);
+      const loopCount = Math.ceil(targetDuration / originalDuration);
 
-      // Gunakan fungsi looping baru alih-alih trimVideo
-      await createLoopedVideo(tempVideo, processedVideo, video.duration);
+      console.log(
+        `Original duration: ${originalDuration}s, Loop count: ${loopCount}`
+      );
 
-      videoOutputPaths.push(processedVideo);
+      // Menggunakan pendekatan yang lebih sederhana dan stabil
+      const tempFiles = [];
+
+      // Jika hanya perlu 1 loop, langsung trim
+      if (loopCount <= 1) {
+        await trimAudio(inputPath, outputPath, targetDuration);
+        resolve();
+        return;
+      }
+
+      // Untuk multiple loops, gunakan concat method yang lebih stabil
+      const concatList = [];
+      for (let i = 0; i < loopCount; i++) {
+        concatList.push(inputPath);
+      }
+
+      // Buat file list untuk concat
+      const listFile = path.join(
+        path.dirname(outputPath),
+        `loop_list_${Date.now()}.txt`
+      );
+      const fileList = concatList
+        .map((file) => `file '${path.resolve(file).replace(/'/g, "\\'")}'`)
+        .join("\n");
+      fs.writeFileSync(listFile, fileList);
+
+      ffmpeg()
+        .input(listFile)
+        .inputOptions(["-f", "concat", "-safe", "0"])
+        .duration(targetDuration)
+        .audioCodec("aac")
+        .audioBitrate("128k")
+        .audioChannels(2)
+        .audioFrequency(44100)
+        .outputOptions(["-avoid_negative_ts", "make_zero"])
+        .output(outputPath)
+        .on("start", (cmd) => {
+          console.log("Loop command:", cmd);
+        })
+        .on("end", () => {
+          try {
+            fs.unlinkSync(listFile);
+          } catch (e) {}
+          console.log(`Loop completed: ${path.basename(outputPath)}`);
+          resolve();
+        })
+        .on("error", (err) => {
+          try {
+            fs.unlinkSync(listFile);
+          } catch (e) {}
+          console.error("Loop error:", err);
+          reject(err);
+        })
+        .run();
+    } catch (error) {
+      console.error("Loop preparation error:", error);
+      reject(error);
     }
+  });
+}
 
-    // Concatenate videos
-    const mergedVideo = path.join(TEMP_DIR, `${jobId}_merged.mp4`);
-    await concatenateVideos(videoOutputPaths, mergedVideo);
+// Fungsi untuk mixing voice dengan backsound - DIPERBAIKI TOTAL
+function mixVoiceWithBacksound(
+  voicePath,
+  backsoundPath,
+  outputPath,
+  voiceDuration
+) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      console.log("=== MIXING AUDIO ===");
+      console.log(`Voice: ${voicePath}, Duration: ${voiceDuration}s`);
+      console.log(`Backsound: ${backsoundPath}`);
 
-    // Download audio
-    const audioPath = path.join(TEMP_DIR, `${jobId}_audio.mp3`);
-    await downloadFile(audioUrl, audioPath);
+      // Validasi file dengan ffprobe
+      await validateMediaFile(voicePath, "audio");
+      await validateMediaFile(backsoundPath, "audio");
 
-    // Merge with audio
-    const finalOutput = path.join(TEMP_DIR, `${jobId}_final.mp4`);
-    await addAudioToVideo(mergedVideo, audioPath, finalOutput);
+      const backsoundDuration = await getAudioDuration(backsoundPath);
+      console.log(`Backsound duration: ${backsoundDuration}s`);
 
-    res.download(finalOutput, "final_video.mp4", () => {
-      fs.removeSync(TEMP_DIR); // Cleanup after download
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Processing failed", detail: err.message });
-  }
-});
+      const processedBacksound = path.join(
+        path.dirname(outputPath),
+        `processed_bg_${Date.now()}.mp3`
+      );
 
-// Fungsi untuk mengkonversi gambar menjadi video dengan efek sederhana
-async function createVideoFromImage(imagePath, outputPath, duration) {
+      // Sesuaikan durasi backsound dengan voice
+      console.log("Processing backsound duration...");
+      if (backsoundDuration < voiceDuration) {
+        console.log("Looping backsound...");
+        await loopAudio(backsoundPath, processedBacksound, voiceDuration);
+      } else if (backsoundDuration > voiceDuration) {
+        console.log("Trimming backsound...");
+        await trimAudio(backsoundPath, processedBacksound, voiceDuration);
+      } else {
+        // Durasi sama, copy saja
+        console.log("Copying backsound...");
+        fs.copyFileSync(backsoundPath, processedBacksound);
+      }
+
+      // Verifikasi processed backsound
+      if (!fs.existsSync(processedBacksound)) {
+        throw new Error("Failed to process backsound");
+      }
+
+      console.log("Mixing voice and backsound...");
+      ffmpeg()
+        .input(voicePath)
+        .input(processedBacksound)
+        .complexFilter([
+          "[0:a]volume=1[a1]",
+          "[1:a]volume=0.3[a2]",
+          "[a1][a2]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+        ])
+        .outputOptions([
+          "-map",
+          "[aout]",
+          "-acodec",
+          "libmp3lame",
+          "-b:a",
+          "128k",
+          "-ac",
+          "2",
+          "-ar",
+          "44100",
+        ])
+        .output(outputPath)
+        .on("start", (cmd) => {
+          console.log("Mix command:", cmd);
+        })
+        .on("progress", (progress) => {
+          if (progress.percent) {
+            console.log(`Mixing progress: ${Math.round(progress.percent)}%`);
+          }
+        })
+        .on("end", () => {
+          console.log("Mixing completed successfully");
+          try {
+            fs.unlinkSync(processedBacksound);
+          } catch (e) {
+            console.error("Cleanup error:", e);
+          }
+          resolve();
+        })
+        .on("error", (err) => {
+          console.error("Mixing error:", err);
+          try {
+            fs.unlinkSync(processedBacksound);
+          } catch (e) {}
+          reject(err);
+        })
+        .run();
+    } catch (error) {
+      console.error("Mix preparation error:", error);
+      reject(error);
+    }
+  });
+}
+
+// FUNGSI YANG DIPERBAIKI: Buat video 2K 60fps tanpa efek
+function createVideoFromImage(imagePath, outputPath, duration) {
   return new Promise((resolve, reject) => {
-    // Bersihkan path output untuk menghindari masalah karakter khusus
-    const safeOutputPath = outputPath.replace(/[\\/:*?"<>|]/g, "_");
+    duration = Math.max(1, Math.floor(duration || 5));
 
-    // Pastikan direktori temp ada
-    const outputDir = path.dirname(outputPath);
-    fs.ensureDirSync(outputDir, { mode: 0o777 }); // Izin penuh untuk direktori
+    console.log(
+      `Creating 2K 60fps video: ${path.basename(imagePath)} - ${duration}s`
+    );
 
-    // Cek apakah file output sudah ada, jika ada hapus dulu
+    // Pastikan direktori output ada
+    fs.ensureDirSync(path.dirname(outputPath));
+
+    // Hapus file output jika sudah ada
     if (fs.existsSync(outputPath)) {
       try {
         fs.unlinkSync(outputPath);
-      } catch (err) {
-        console.warn("Failed to delete existing output file:", err);
+      } catch (e) {}
+    }
+
+    // Verifikasi file gambar ada
+    if (!fs.existsSync(imagePath)) {
+      reject(new Error(`Image file not found: ${imagePath}`));
+      return;
+    }
+
+    // Timeout untuk mencegah hanging
+    const timeout = setTimeout(() => {
+      console.log(`Timeout for ${path.basename(imagePath)}`);
+      reject(new Error(`Video creation timeout for ${imagePath}`));
+    }, 120000); // 2 menit timeout untuk 2K
+
+    // Filter untuk 2K (2560x1440) dengan aspect ratio yang benar
+    const videoFilter =
+      "scale=2560:1440:force_original_aspect_ratio=decrease,pad=2560:1440:(ow-iw)/2:(oh-ih)/2:color=black";
+
+    const command = ffmpeg(imagePath)
+      .inputOptions(["-loop 1", "-t", duration.toString()])
+      .outputOptions([
+        "-vf",
+        videoFilter,
+        "-c:v libx264",
+        "-pix_fmt yuv420p",
+        "-r 60", // 60 fps
+        "-preset medium", // Balance antara speed dan quality
+        "-crf 18", // High quality untuk 2K
+        "-profile:v high",
+        "-level:v 4.2",
+        "-an", // No audio
+        "-movflags +faststart",
+        "-y",
+      ])
+      .output(outputPath)
+      .on("start", (cmd) => {
+        console.log("FFmpeg command:", cmd);
+      })
+      .on("progress", (progress) => {
+        if (progress.percent) {
+          console.log(
+            `Processing ${path.basename(imagePath)}: ${Math.round(
+              progress.percent
+            )}%`
+          );
+        }
+      })
+      .on("end", () => {
+        clearTimeout(timeout);
+        console.log(`2K 60fps video created: ${outputPath}`);
+        resolve();
+      })
+      .on("error", (err) => {
+        clearTimeout(timeout);
+        console.error("FFmpeg error:", err);
+        reject(err);
+      });
+
+    try {
+      command.run();
+    } catch (error) {
+      clearTimeout(timeout);
+      reject(error);
+    }
+  });
+}
+
+// Fungsi untuk menggabungkan video menggunakan file list method
+function concatenateVideos(videoPaths, outputPath) {
+  return new Promise((resolve, reject) => {
+    const videoCount = videoPaths.length;
+    console.log(`Concatenating ${videoCount} videos...`);
+
+    if (videoCount === 1) {
+      fs.copySync(videoPaths[0], outputPath);
+      resolve();
+      return;
+    }
+
+    // Verifikasi semua file video ada
+    for (const videoPath of videoPaths) {
+      if (!fs.existsSync(videoPath)) {
+        reject(new Error(`Video file not found: ${videoPath}`));
+        return;
       }
     }
 
-    // Tentukan filter berdasarkan efek yang dipilih
-    let vfFilter = "scale=2560:1440";
+    // Buat file list untuk concat demuxer
+    const listPath = path.join(path.dirname(outputPath), "filelist.txt");
 
-    // Hitung total frame berdasarkan durasi (60 fps untuk pergerakan sangat halus)
-    const totalFrames = Math.round(duration * 60);
+    // Generate file list dengan path yang aman
+    const fileList = videoPaths
+      .map((videoPath) => {
+        const safePath = path.resolve(videoPath).replace(/'/g, "\\'");
+        return `file '${safePath}'`;
+      })
+      .join("\n");
 
-    // Terapkan efek yang sesuai dengan pergerakan yang lebih halus
-    // if (effect) {
-    //   switch (effect) {
-    //     case "zoom-out":
-    //       // Zoom out perlahan dari 1.3 ke 1.0 sepanjang durasi video dengan kurva halus
-    //       vfFilter = `zoompan=z='1.3-(0.3*on/${totalFrames})':d=${totalFrames}:s=1920x1080:fps=60`;
-    //       break;
-    //     case "pan-left":
-    //       // Pan dari kanan ke kiri perlahan sepanjang durasi video
-    //       vfFilter = `zoompan=z=1.1:x='iw-(iw*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
-    //       break;
-    //     case "pan-right":
-    //       // Pan dari kiri ke kanan perlahan sepanjang durasi video
-    //       vfFilter = `zoompan=z=1.1:x='0+(iw*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
-    //       break;
-    //     case "shift-up":
-    //       // Shift dari bawah ke atas perlahan sepanjang durasi video
-    //       vfFilter = `zoompan=z=1.1:y='ih-(ih*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
-    //       break;
-    //     case "shift-down":
-    //       // Shift dari atas ke bawah perlahan sepanjang durasi video
-    //       vfFilter = `zoompan=z=1.1:y='0+(ih*on/${totalFrames}*0.3)':d=${totalFrames}:s=1920x1080:fps=60`;
-    //       break;
-    //     default:
-    //       // Gunakan scale default jika efek tidak dikenali
-    //       break;
-    //   }
-    // }
+    fs.writeFileSync(listPath, fileList);
 
-    // Gunakan filter dengan efek yang dipilih
-    ffmpeg(imagePath)
-      .inputOptions(["-loop 1"])
+    ffmpeg()
+      .input(listPath)
+      .inputOptions(["-f concat", "-safe 0"])
       .outputOptions([
-        "-vf",
-        vfFilter,
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-t",
-        duration.toString(),
-        "-preset",
-        "slow", // Menggunakan preset "slow" untuk kualitas lebih baik
-        "-crf",
-        "18", // CRF rendah (18) untuk kualitas tinggi
-        "-tune",
-        "stillimage",
-        "-r", // Tambahkan parameter frame rate output
-        "60", // Set output frame rate ke 60fps
-        "-y", // Paksa overwrite
+        "-c:v libx264",
+        "-preset medium",
+        "-crf 18", // High quality untuk 2K
+        "-pix_fmt yuv420p",
+        "-r 60", // Maintain 60fps
+        "-profile:v high",
+        "-level:v 4.2",
+        "-movflags +faststart",
+        "-y",
       ])
       .output(outputPath)
-      .on("start", (commandLine) => {
-        console.log("FFmpeg command:", commandLine);
+      .on("start", (cmd) => console.log("Concat command:", cmd))
+      .on("progress", (progress) => {
+        console.log(
+          `Concatenation progress: ${Math.round(progress.percent || 0)}%`
+        );
       })
-      .on("end", resolve)
+      .on("end", () => {
+        try {
+          fs.unlinkSync(listPath);
+        } catch (e) {}
+        console.log(
+          `Successfully concatenated ${videoCount} videos in 2K 60fps`
+        );
+        resolve();
+      })
       .on("error", (err) => {
-        console.error("FFmpeg error:", err);
-
-        // Jika masih error, coba dengan opsi yang lebih sederhana
-        console.log("Trying with minimal options...");
-
-        // Gunakan scale default untuk fallback
-        ffmpeg(imagePath)
-          .inputOptions(["-loop 1"])
-          .outputOptions([
-            "-vf",
-            "-vf scale=2560:1440", // Ubah ke resolusi 2K
-            "-c:v",
-            "libx264",
-            "-crf",
-            "20",
-            "-t",
-            duration.toString(),
-            "-r",
-            "60",
-            "-y",
-          ])
-          .output(outputPath)
-          .on("end", resolve)
-          .on("error", reject)
-          .run();
+        try {
+          fs.unlinkSync(listPath);
+        } catch (e) {}
+        console.error("Concatenation error:", err);
+        reject(err);
       })
       .run();
   });
 }
 
-// Fungsi untuk mendapatkan efek kamera secara acak
-function getRandomEffect() {
-  const effects = [
-    "zoom-out",
-    "pan-left",
-    "pan-right",
-    "shift-up",
-    "shift-down",
-  ];
+// Fungsi untuk menambahkan audio ke video - DIPERBAIKI
+function addAudioToVideo(
+  videoPath,
+  audioPath,
+  outputPath,
+  hasBacksound = false,
+  backsoundPath = null
+) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      console.log("=== ADDING AUDIO TO 2K 60fps VIDEO ===");
+      console.log(`Video: ${videoPath}`);
+      console.log(`Audio: ${audioPath}`);
+      console.log(`Has backsound: ${hasBacksound}`);
 
-  return effects[Math.floor(Math.random() * effects.length)];
+      // Validasi file existence
+      if (!fs.existsSync(videoPath)) {
+        throw new Error(`Video file not found: ${videoPath}`);
+      }
+      if (!fs.existsSync(audioPath)) {
+        throw new Error(`Audio file not found: ${audioPath}`);
+      }
+
+      let finalAudioPath = audioPath;
+
+      if (hasBacksound && backsoundPath && fs.existsSync(backsoundPath)) {
+        console.log("Mixing audio with backsound...");
+        const voiceDuration = await getAudioDuration(audioPath);
+        const mixedAudioPath = path.join(
+          path.dirname(outputPath),
+          `mixed_${Date.now()}.mp3`
+        );
+
+        await mixVoiceWithBacksound(
+          audioPath,
+          backsoundPath,
+          mixedAudioPath,
+          voiceDuration
+        );
+        finalAudioPath = mixedAudioPath;
+      }
+
+      console.log("Combining video and audio...");
+
+      // Timeout untuk mencegah hanging
+      const timeout = setTimeout(() => {
+        console.log("Video-audio combination timeout");
+        reject(new Error("Video-audio combination timeout"));
+      }, 300000); // 5 menit timeout
+
+      ffmpeg()
+        .input(videoPath)
+        .input(finalAudioPath)
+        .outputOptions([
+          "-c:v",
+          "copy", // Copy video stream untuk maintain quality
+          "-c:a",
+          "aac",
+          "-b:a",
+          "128k", // Consistent bitrate
+          "-ac",
+          "2",
+          "-ar",
+          "44100",
+          "-shortest", // Use shortest input duration
+          "-movflags",
+          "+faststart",
+          "-avoid_negative_ts",
+          "make_zero",
+          "-y", // Overwrite output file
+        ])
+        .output(outputPath)
+        .on("start", (cmd) => {
+          console.log("Video-audio combine command:", cmd);
+        })
+        .on("progress", (progress) => {
+          if (progress.percent) {
+            console.log(
+              `Video-audio progress: ${Math.round(progress.percent)}%`
+            );
+          }
+        })
+        .on("end", () => {
+          clearTimeout(timeout);
+          console.log("Video-audio combination completed");
+
+          // Cleanup mixed audio if it was created
+          if (finalAudioPath !== audioPath) {
+            try {
+              fs.unlinkSync(finalAudioPath);
+            } catch (e) {
+              console.error("Mixed audio cleanup error:", e);
+            }
+          }
+          resolve();
+        })
+        .on("error", (err) => {
+          clearTimeout(timeout);
+          console.error("Video-audio combination error:", err);
+
+          // Cleanup on error
+          if (finalAudioPath !== audioPath) {
+            try {
+              fs.unlinkSync(finalAudioPath);
+            } catch (e) {}
+          }
+          reject(err);
+        })
+        .run();
+    } catch (error) {
+      console.error("Add audio preparation error:", error);
+      reject(error);
+    }
+  });
 }
 
-// Fungsi untuk mengkonversi format durasi "1:26" menjadi detik
-function convertDurationToSeconds(duration) {
-  if (!duration) return 0;
+// Fungsi untuk download file dengan validasi
+function downloadFile(url, outputPath) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith("https:") ? https : http;
+    const file = fs.createWriteStream(outputPath);
 
-  // Jika sudah dalam bentuk detik (angka)
-  if (!isNaN(duration)) return parseInt(duration);
+    client
+      .get(url, (response) => {
+        if (response.statusCode === 302 || response.statusCode === 301) {
+          file.close();
+          // fs.unlinkSync(outputPath);
+          downloadFile(response.headers.location, outputPath)
+            .then(resolve)
+            .catch(reject);
+          return;
+        }
 
-  // Jika dalam format "1:26"
-  const parts = duration.split(":");
-  if (parts.length === 2) {
-    const minutes = parseInt(parts[0]);
-    const seconds = parseInt(parts[1]);
-    return minutes * 60 + seconds;
-  }
+        if (response.statusCode !== 200) {
+          file.close();
+          // fs.unlinkSync(outputPath);
+          reject(new Error(`Download failed: ${response.statusCode}`));
+          return;
+        }
 
-  // Jika dalam format "1:30:45" (jam:menit:detik)
-  if (parts.length === 3) {
-    const hours = parseInt(parts[0]);
-    const minutes = parseInt(parts[1]);
-    const seconds = parseInt(parts[2]);
-    return hours * 3600 + minutes * 60 + seconds;
-  }
+        response.pipe(file);
 
-  return 0;
+        file.on("finish", () => {
+          file.close();
+          if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+            resolve();
+          } else {
+            reject(new Error("Downloaded file is empty"));
+          }
+        });
+
+        file.on("error", (err) => {
+          fs.unlink(outputPath, () => {});
+          reject(err);
+        });
+      })
+      .on("error", (err) => {
+        try {
+          file.close();
+          fs.unlinkSync(outputPath);
+        } catch (e) {}
+        reject(err);
+      });
+  });
 }
 
-// Endpoint untuk merge-image
+// Fungsi untuk parse durasi dari string durasi
+function parseDurationFromText(durationText) {
+  const match = durationText.match(/Image duration: (\d+) seconds/);
+  return match ? parseInt(match[1]) : 5; // default 5 detik jika tidak ditemukan
+}
+
+// Endpoint utama - DIPERBAIKI untuk input format baru
 app.post("/merge-image", async (req, res) => {
-  const { imageUrls, audioUrl, durasi, durasiMusic } = req.body;
-  // Hapus 'effects' dari destructuring karena kita akan selalu menggunakan efek acak
+  const { imageUrls, audioUrl, durasi, Musicbacksound } = req.body;
 
-  // Hapus definisi lokal TEMP_DIR karena sudah didefinisikan secara global
-  // const TEMP_DIR = path.join(__dirname, "temp");
-  // fs.ensureDirSync(TEMP_DIR, { mode: 0o755 });
+  console.log("=== NEW REQUEST ===");
+  console.log("Images:", imageUrls?.length || 0);
+  console.log("Has backsound:", !!Musicbacksound);
 
-  // Bersihkan direktori temp sebelum memulai proses baru
-  try {
-    fs.emptyDirSync(TEMP_DIR);
-  } catch (err) {
-    console.error("Error cleaning temp directory:", err);
-  }
-
-  if (!imageUrls || !audioUrl || !imageUrls.length) {
+  // Validasi input
+  if (!imageUrls?.length || !audioUrl) {
     return res.status(400).json({ error: "imageUrls dan audioUrl diperlukan" });
   }
 
-  // Konversi durasi musik ke detik
-  const totalDurationInSeconds = convertDurationToSeconds(durasiMusic);
-
-  // Hitung durasi yang adil untuk setiap gambar
-  const fairDurationPerImage = Math.floor(
-    totalDurationInSeconds / imageUrls.length
-  );
-
-  // Buat array durasi yang adil untuk setiap gambar
-  const imageDurations = Array(imageUrls.length).fill(fairDurationPerImage);
-
-  // Distribusikan sisa detik (jika ada) ke gambar-gambar awal
-  const remainingSeconds =
-    totalDurationInSeconds - fairDurationPerImage * imageUrls.length;
-  for (let i = 0; i < remainingSeconds; i++) {
-    imageDurations[i % imageUrls.length]++;
-  }
-
-  // Buat array efek acak untuk setiap gambar
-  const imageEffects = [];
-  for (let i = 0; i < imageUrls.length; i++) {
-    imageEffects.push(getRandomEffect());
-  }
-
   const jobId = uuidv4();
-  const videoOutputPaths = [];
+  const jobTempDir = path.join(TEMP_DIR, jobId);
+  fs.ensureDirSync(jobTempDir);
 
   try {
-    // Download dan proses semua gambar
-    for (const [index, imageUrl] of imageUrls.entries()) {
-      // Bersihkan URL dari backticks jika ada
-      const cleanImageUrl = imageUrl.replace(/`/g, "").trim();
+    // 1. Download dan analisis audio
+    console.log("Downloading voice audio...");
+    const voiceAudioPath = path.join(jobTempDir, "voice.mp3");
+    await downloadFile(audioUrl.replace(/`/g, "").trim(), voiceAudioPath);
 
-      const tempImage = path.join(TEMP_DIR, `${jobId}_image_${index}.jpg`);
-      const processedVideo = path.join(TEMP_DIR, `${jobId}_video_${index}.mp4`);
+    const audioDuration = await getAudioDuration(voiceAudioPath);
+    console.log(`Audio duration: ${audioDuration} seconds`);
 
-      try {
-        // Download gambar
-        await downloadFile(cleanImageUrl, tempImage);
+    // 2. Parse durasi dari array durasi atau hitung otomatis
+    let imageDurations = [];
 
-        // Verifikasi file gambar ada
-        if (!fs.existsSync(tempImage)) {
-          throw new Error(`File gambar tidak berhasil diunduh: ${tempImage}`);
-        }
+    if (durasi && Array.isArray(durasi)) {
+      // Parse durasi dari array durasi
+      imageDurations = durasi.map((d) => parseDurationFromText(d));
+      console.log("Parsed durations:", imageDurations);
+    } else {
+      // Hitung durasi otomatis jika tidak ada array durasi
+      const imageCount = imageUrls.length;
+      const baseDuration = Math.max(1, Math.floor(audioDuration / imageCount));
+      const extraSeconds = Math.max(
+        0,
+        audioDuration - baseDuration * imageCount
+      );
 
-        // Konversi gambar menjadi video dengan efek kamera acak
-        await createVideoFromImage(
-          tempImage,
-          processedVideo,
-          imageDurations[index],
-          imageEffects[index]
-        );
-
-        videoOutputPaths.push(processedVideo);
-      } catch (err) {
-        console.error(`Error processing image ${index}:`, err);
-        throw err; // Re-throw untuk ditangkap di catch utama
+      imageDurations = Array(imageCount).fill(baseDuration);
+      for (let i = 0; i < Math.floor(extraSeconds) && i < imageCount; i++) {
+        imageDurations[i] += 1;
       }
+      console.log("Calculated durations:", imageDurations);
     }
 
-    // Gabungkan semua video
-    const mergedVideo = path.join(TEMP_DIR, `${jobId}_merged.mp4`);
-    await concatenateVideos(videoOutputPaths, mergedVideo);
+    // 3. Download backsound jika ada
+    let backsoundPath = null;
+    const hasBacksound =
+      Musicbacksound &&
+      typeof Musicbacksound === "string" &&
+      Musicbacksound.trim().length > 0 &&
+      !Musicbacksound.includes("undefined");
 
-    // Download audio (bersihkan URL dari backticks jika ada)
-    const cleanAudioUrl = audioUrl.replace(/`/g, "").trim();
-    const audioPath = path.join(TEMP_DIR, `${jobId}_audio.mp3`);
-    await downloadFile(cleanAudioUrl, audioPath);
+    if (hasBacksound) {
+      console.log("Downloading backsound...");
+      backsoundPath = path.join(jobTempDir, "backsound.mp3");
+      await downloadFile(
+        Musicbacksound.replace(/`/g, "").trim(),
+        backsoundPath
+      );
+    }
 
-    // Gabungkan video dengan audio
-    const finalOutput = path.join(TEMP_DIR, `${jobId}_final.mp4`);
-    await addAudioToVideo(mergedVideo, audioPath, finalOutput);
+    // 4. Proses setiap gambar menjadi video 2K 60fps
+    const videoPaths = [];
 
-    // Perbaikan untuk memastikan video dapat diputar dengan benar
-    const optimizedOutput = path.join(TEMP_DIR, `${jobId}_optimized.mp4`);
-    await new Promise((resolve, reject) => {
-      ffmpeg(finalOutput)
-        .outputOptions([
-          "-movflags faststart",
-          "-pix_fmt yuv420p",
-          "-c:v libx264",
-          "-c:a aac",
-          "-vf scale=2560:1440", // Ubah ke resolusi 2K
-          "-aspect 16:9",
-          "-preset ultrafast",
-          "-crf 23",
-        ])
-        .output(optimizedOutput)
-        .on("end", resolve)
-        .on("error", reject)
-        .run();
+    for (const [index, imageUrl] of imageUrls.entries()) {
+      console.log(`Processing image ${index + 1}/${imageUrls.length}`);
+
+      const imagePath = path.join(jobTempDir, `image_${index}.jpg`);
+      const videoPath = path.join(jobTempDir, `video_${index}.mp4`);
+
+      // Download gambar
+      await downloadFile(imageUrl.replace(/`/g, "").trim(), imagePath);
+
+      // Buat video 2K 60fps
+      await createVideoFromImage(
+        imagePath,
+        videoPath,
+        imageDurations[index] || 5
+      );
+      videoPaths.push(videoPath);
+    }
+
+    // 5. Gabungkan semua video
+    console.log("Concatenating videos in 2K 60fps...");
+    const mergedVideoPath = path.join(jobTempDir, "merged.mp4");
+    await concatenateVideos(videoPaths, mergedVideoPath);
+
+    // 6. Tambahkan audio ke video
+    console.log("Adding audio to 2K 60fps video...");
+    const finalVideoPath = path.join(jobTempDir, "final.mp4");
+    await addAudioToVideo(
+      mergedVideoPath,
+      voiceAudioPath,
+      finalVideoPath,
+      hasBacksound,
+      backsoundPath
+    );
+
+    // 7. Kirim hasil
+    console.log("Sending final 2K 60fps video...");
+    res.download(finalVideoPath, `video_2K_60fps_${jobId}.mp4`, (err) => {
+      if (err) {
+        console.error("Error sending file:", err);
+      }
+
+      // Cleanup
+      setTimeout(() => {
+        try {
+          fs.removeSync(jobTempDir);
+          console.log("Cleanup completed");
+        } catch (e) {
+          console.error("Cleanup error:", e);
+        }
+      }, 5000);
+    });
+  } catch (error) {
+    console.error("Processing error:", error);
+    res.status(500).json({
+      error: "Pemrosesan gagal",
+      detail: error.message,
     });
 
-    // Kirim file hasil sebagai respons
-    res.download(optimizedOutput, "final_video.mp4", () => {
-      // Bersihkan file sementara setelah download selesai
-      fs.removeSync(TEMP_DIR);
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Pemrosesan gagal", detail: err.message });
-    // Bersihkan file sementara jika terjadi error
+    // Cleanup on error
     try {
-      fs.removeSync(TEMP_DIR);
-    } catch (cleanupErr) {
-      console.error("Error cleaning up temp directory:", cleanupErr);
+      fs.removeSync(jobTempDir);
+    } catch (e) {
+      console.error("Error cleanup:", e);
     }
   }
 });
