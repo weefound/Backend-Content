@@ -227,27 +227,60 @@ function trimAudio(inputPath, outputPath, duration) {
       fs.mkdirSync(outputDir, { recursive: true });
     }
 
-    // Approach yang lebih sederhana tanpa ffprobe dulu
-    ffmpeg(inputPath)
-      .format("mp3") // Set output format explicitly
-      .duration(duration) // FFmpeg akan handle jika duration > original
-      .audioCodec("libmp3lame")
-      .audioBitrate("128k")
-      .audioChannels(2)
-      .audioFrequency(44100)
-      .output(outputPath)
-      .on("start", (cmd) => {
-        console.log("Trim command:", cmd);
-      })
-      .on("end", () => {
-        console.log(`Trim completed: ${path.basename(outputPath)}`);
-        resolve();
-      })
-      .on("error", (err) => {
-        console.error("Trim error:", err);
-        reject(err);
-      })
-      .run();
+    function isSameFilePath(inputPath, outputPath) {
+      const resolvedInput = path.resolve(inputPath);
+      const resolvedOutput = path.resolve(outputPath);
+
+      return resolvedInput === resolvedOutput;
+    }
+
+    if (isSameFilePath(inputPath, outputPath)) {
+      const tempOutput = outputPath + ".tmp.mp3";
+      ffmpeg(inputPath)
+        .format("mp3")
+        .duration(duration)
+        .audioCodec("libmp3lame")
+        .audioBitrate("128k")
+        .audioChannels(2)
+        .audioFrequency(44100)
+        .output(tempOutput)
+        .on("start", (cmd) => {
+          console.log("Trim command:", cmd);
+        })
+        .on("end", () => {
+          fs.renameSync(tempOutput, outputPath); // Ganti file lama
+          console.log(`Trim completed: ${path.basename(outputPath)}`);
+          resolve();
+        })
+        .on("error", (err) => {
+          console.error("Trim error:", err);
+          if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput);
+          reject(err);
+        })
+        .run();
+    } else {
+      // Approach yang lebih sederhana tanpa ffprobe dulu
+      ffmpeg(inputPath)
+        .format("mp3") // Set output format explicitly
+        .duration(duration) // FFmpeg akan handle jika duration > original
+        .audioCodec("libmp3lame")
+        .audioBitrate("128k")
+        .audioChannels(2)
+        .audioFrequency(44100)
+        .output(outputPath)
+        .on("start", (cmd) => {
+          console.log("Trim command:", cmd);
+        })
+        .on("end", () => {
+          console.log(`Trim completed: ${path.basename(outputPath)}`);
+          resolve();
+        })
+        .on("error", (err) => {
+          console.error("Trim error:", err);
+          reject(err);
+        })
+        .run();
+    }
   });
 }
 
@@ -266,56 +299,53 @@ function loopAudio(inputPath, outputPath, targetDuration) {
         `Original duration: ${originalDuration}s, Loop count: ${loopCount}`
       );
 
-      // Menggunakan pendekatan yang lebih sederhana dan stabil
-      const tempFiles = [];
-
-      // Jika hanya perlu 1 loop, langsung trim
       if (loopCount <= 1) {
         await trimAudio(inputPath, outputPath, targetDuration);
         resolve();
         return;
       }
 
-      // Untuk multiple loops, gunakan concat method yang lebih stabil
-      const concatList = [];
+      // Gunakan multiple input dan concat filter
+      let command = ffmpeg();
       for (let i = 0; i < loopCount; i++) {
-        concatList.push(inputPath);
+        command = command.input(inputPath);
       }
 
-      // Buat file list untuk concat
-      const listFile = path.join(
-        path.dirname(outputPath),
-        `loop_list_${Date.now()}.txt`
-      );
-      const fileList = concatList
-        .map((file) => `file '${path.resolve(file).replace(/'/g, "\\'")}'`)
-        .join("\n");
-      fs.writeFileSync(listFile, fileList);
-
-      ffmpeg()
-        .input(listFile)
-        .inputOptions(["-f", "concat", "-safe", "0"])
-        .duration(targetDuration)
-        .audioCodec("aac")
-        .audioBitrate("128k")
-        .audioChannels(2)
-        .audioFrequency(44100)
-        .outputOptions(["-avoid_negative_ts", "make_zero"])
-        .output(outputPath)
+      command
         .on("start", (cmd) => {
           console.log("Loop command:", cmd);
         })
-        .on("end", () => {
-          try {
-            fs.unlinkSync(listFile);
-          } catch (e) {}
+        .complexFilter([
+          {
+            filter: "concat",
+            options: {
+              n: loopCount,
+              v: 0,
+              a: 1,
+            },
+          },
+        ])
+        .outputOptions([
+          "-avoid_negative_ts",
+          "make_zero",
+          "-ac",
+          "2",
+          "-ar",
+          "44100",
+          "-b:a",
+          "128k",
+        ])
+        .audioCodec("aac")
+        .format("mp4") // atau "m4a", tergantung output yang kamu mau
+        .output(outputPath)
+        .on("end", async () => {
           console.log(`Loop completed: ${path.basename(outputPath)}`);
+
+          // Trim agar durasinya pas
+          await trimAudio(outputPath, outputPath, targetDuration);
           resolve();
         })
         .on("error", (err) => {
-          try {
-            fs.unlinkSync(listFile);
-          } catch (e) {}
           console.error("Loop error:", err);
           reject(err);
         })
