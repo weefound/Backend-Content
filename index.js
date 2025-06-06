@@ -484,7 +484,7 @@ function createVideoFromImage(imagePath, outputPath, duration) {
     const timeout = setTimeout(() => {
       console.log(`Timeout for ${path.basename(imagePath)}`);
       reject(new Error(`Video creation timeout for ${imagePath}`));
-    }, 600000); // 10 menit timeout untuk 2K
+    }, 1200000); // 20 menit timeout untuk 2K
 
     // Filter untuk 2K (2560x1440) dengan aspect ratio yang benar
     const videoFilter =
@@ -661,7 +661,7 @@ function addAudioToVideo(
       const timeout = setTimeout(() => {
         console.log("Video-audio combination timeout");
         reject(new Error("Video-audio combination timeout"));
-      }, 600000); // 5 menit timeout
+      }, 1200000); // 20 menit timeout untuk 2K
 
       ffmpeg()
         .input(videoPath)
@@ -903,7 +903,7 @@ app.post("/merge-image", async (req, res) => {
         } catch (e) {
           console.error("Cleanup error:", e);
         }
-      }, 600000);
+      }, 1200000); // 20 menit timeout untuk 2K
     });
   } catch (error) {
     console.error("Processing error:", error);
