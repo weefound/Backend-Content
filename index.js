@@ -48,7 +48,7 @@ app.use(express.urlencoded({ extended: true }));
 server.setTimeout(3600000);
 
 app.get("/", (req, res) => {
-  res.send("backend content");
+  res.send("backend contentt");
 });
 
 app.post("/api/gemini", upload.single("file"), async (req, res) => {
