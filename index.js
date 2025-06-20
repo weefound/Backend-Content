@@ -92,10 +92,9 @@ app.post("/api/gemini", upload.single("file"), async (req, res) => {
       contents,
     });
 
-    res.status(200).json({ status: 200, data: response });
+    return res.status(200).json({ status: 200, data: response });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ status: 500, message: error.message });
+    return res.status(500).json({ status: 500, message: error.message });
   }
 });
 
