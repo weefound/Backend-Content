@@ -45,7 +45,6 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json()); // Increased limit for larger JSON payloads
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.urlencoded({ extended: true }));
-server.setTimeout(3600000);
 
 app.get("/", (req, res) => {
   res.send("backend contentt");
